@@ -1,102 +1,71 @@
 require('rredlist')
 require('nbaR')
 
-data <- read.csv('../data/20190510-2-museum-objects.tsv', header=T, sep="\t", skip=1)
-counter <<- 0
+data <- read.csv('../data/20190510-2-museum-objects.tsv', header=T, sep="\t", skip=1)[672:3597,]
 sc <- SpecimenClient$new()
 
-
-get_iucn_data <- function(row) {
-    counter <<- counter + 1
-    cat("Processing item # ", counter, " of ", nrow(data), "\n")
-    name <- unname(row["SCname"])
-    regnr <- unname(row["Registratienummer"])
-    regnr <- gsub("\\s", "", regnr)
-    cat("Querying IUCN for ", name, " regnr: ", regnr, "\n")
-    ## parse out characters that make icun api error
-    name <- gsub("/", "", name)
-    result <- c(sciname=name, regnr=regnr, iucn_id=NA, iucn_category=NA,
-                matched_sciname=FALSE, matched_nba_identific=FALSE, matched_col_syn=FALSE, name_tba=FALSE, found=FALSE)
-    found <- FALSE
-    if (name != "tba" | name != "" | regnr != "") {
-        iucn_res <- get_IUCN_for_sciname(name)
-        if(! all(is.na(iucn_res))) {
-            result[c('iucn_id', 'iucn_category')] <- iucn_res[c('iucn_id', 'iucn_category')]
-            result['matched_sciname'] <- TRUE
-            cat("\tFound IUCN data\n")
-            found <- TRUE
-        } else {
-            cat("\tIUCN query gives empty result, checking NBA for regnr ", regnr, "\n")
-            exists <- specimen_exists(regnr)
-
-            if (exists) {
-                cat("\tRegnr exists, getting name from identifications\n")
-                ## tab <- specimen_find_by_unit_id(regnr)
-                res <- sc$find_by_unit_id(regnr)
-                if (length(res$content) < 0) {
-                    cat("\tNo specimen found for regnr ", regnr, "\n")
-                } else {
-                    sp <- res$content[[1]]
-                    cat("\tFound ", length(sp$identifications), " identifications\n)")
-                    for(i in seq_along(sp$identifications)) {
-                        id <- sp$identifications[[i]]
-                        new_name <- paste(id$defaultClassification$genus, id$defaultClassification$specificEpithet)
-                        cat("\tQuerying IUCN from identifications with name: ", new_name, "\n")
-                        if (length(new_name) == 0) {
-                            cat("\tName is empty, skipping\n")
-                            next
-                        }
-                        iucn_res <- get_IUCN_for_sciname(new_name)
-                        if( ! all(is.na(iucn_res))) {
-                            result[c('iucn_id', 'iucn_category')] <- iucn_res[c('iucn_id', 'iucn_category')]
-                            result['matched_nba_identific'] <- TRUE
-                            cat("Found IUCN data from identification!\n")
-                            found <- TRUE
-                            break
-                        }
-                    }
-                }
-            }
-            if (! found) {
-                cat("\tStill no record in IUCN found\n")
-                cat("\tSearching for sciname in catalogue of life\n")
-                synonyms <- get_COL_synonyms(name)
-                cat("\tNumber of synonyms: ", length(synonyms), "\n")
-                for (s in synonyms) {
-                    n <- s$fullScientificName
-                    iucn_res <- get_IUCN_for_sciname(n)
-                    if( ! all(is.na(iucn_res))) {
-                        result[c('iucn_id', 'iucn_category')] <- iucn_res[c('iucn_id', 'iucn_category')]
-                        result['matched_col_syn'] <- TRUE
-                        cat("Found IUCN data from synonym!\n")
-                        found <- TRUE
-                        break
-                    }
-                }
-
-            }
-        }
-    } else {
-        result['name_tba'] <- TRUE
-    }
-    result['found'] <- found
-    cat("Data for Specimen found at IUCN : ", found, "\n\n")
-
-    return (result)
-}
-
-get_IUCN_for_sciname<- function(sciname) {
+get_IUCN_for_sciname <- function(sciname) {
     result <- c(iucn_id=NA, iucn_category=NA)
-    s <- rl_search(sciname)
-    if (length(s$result > 0)) {
-        result['iucn_id'] <- s$result$taxonid
-        result['iucn_category'] <- s$result$category
-    }
+
+    tryCatch({
+        s <- rl_search(sciname) 
+        if (length(s$result > 0)) {
+            result['iucn_id'] <- s$result$taxonid
+            result['iucn_category'] <- s$result$category
+        }
+    }, error=function(cond) {
+        message(cond, "\n")
+    })
+        
     return(result)
 }
 
-get_COL_synonyms <- function(sciname) {
-    result <- list()
+get_all_scinames <- function(regnr, sciname) {
+    cat("Collecting more sc. names for name: ", sciname, " regnr: ", regnr, "\n")
+    scinames <- c(sciname)
+    sc <- SpecimenClient$new()
+
+    ## First, lookup the registration number
+    ## and collect scientific names from identifications
+    exists <- specimen_exists(regnr)        
+    if (! is.logical(exists)) {
+        exists <- FALSE
+    }
+    
+    if (exists) {
+        res <- sc$find_by_unit_id(regnr)
+        if (length(res$content) < 0) {
+            cat("No specimen found for regnr ", regnr, "\n")
+        } else {
+            sp <- res$content[[1]]
+            cat("Found ", length(sp$identifications), " identifications\n)")
+            for(i in seq_along(sp$identifications)) {
+                id <- sp$identifications[[i]]
+                name <- paste(id$defaultClassification$genus, id$defaultClassification$specificEpithet)
+                scinames <- c(scinames, name)                
+                ## add also name from ScientificName field
+                sn <- id$scientificName$fullScientificName
+                if (sn != "") {
+                    scinames <- c(scinames, sn)
+                }
+            }
+        }
+    }
+
+    ## Second, look for all synonyms for the scinames found in COL,
+    ## and return also these scinames
+    scinames_col <- c()
+    for (sc in scinames) {
+        scinames_col <- c(scinames_col, get_scinames_from_COL_synonyms(sc))        
+    }
+    ## remove first one as this was the argument    
+    result <- unique(c(scinames, scinames_col))[-1]
+
+    return(result)
+}
+
+get_scinames_from_COL_synonyms <- function(sciname) {
+    result <- c()
 
     ## try to get synonyms from the NBA COL
     tc <- TaxonClient$new()
@@ -110,16 +79,64 @@ get_COL_synonyms <- function(sciname) {
     res <- tc$query(querySpec=qs)
     if (res$content$totalSize > 0) {
         tax <- res$content$resultSet[[1]]$item
-        ## cat ("Number of synonyms : ", length(tax$synonyms), "\n")
-        syn <- tax$synonyms
-        result <- syn
-
+        for (syn in tax$synonyms) {
+            result <- c(result, syn$fullScientificName)
+            ## also store Genus,Species
+            name <- paste(syn$genusOrMonomial, syn$specificEpithet)
+            result <- c(result, name)
+        }        
     }
-    return(result)
+    return(unique(result))
 }
 
 ##iucn_data <- do.call(rbind, apply(data[1:20,], 1, get_iucn_data))
 
-iucn_data <- t(apply(data, 1, get_iucn_data))
+## iucn_data <- t(apply(data, 1, get_iucn_data))
 
 ##sum(as.logical(qqq$matched_sciname)) + sum(as.logical(qqq$matched_col_syn)) + sum(as.logical(qqq$matched_nba_identific))
+## dd <- apply(data[10:100,], 1, function(row){
+##    get_all_scinames(row['Registratienummer'], row['SCname'])
+##})
+
+
+data[,"iucn_id"] <- NA
+data[,"iucn_category"] <- NA
+data[,"found_via_nba"] <- FALSE
+
+for (i in seq_along(rownames(data))) {
+    cat("Processing #", i, " of ", nrow(data), "\n")
+
+    row <- data[i,]
+    sciname <- as.character(row$SCname)
+    sciname <- gsub('/', '', sciname)
+    regnr <- as.character(row$Registratienummer)
+    regnr <- gsub("\\s", "", regnr)
+    
+    cat("Regnr: ", regnr, " sciname: ", sciname, "\n")    
+
+    ## query IUCN with name first
+    cat("Trying to retrieve IUCN data for sciname ", sciname, "\n")
+    
+    iucn_res <- get_IUCN_for_sciname(sciname)
+            
+    if(! all(is.na(iucn_res))) {
+        cat("Found sciname via IUCN API\n")        
+        data[, c("iucn_id", "iucn_category")] <- iucn_res[c("iucn_id", "iucn_category")]
+    } else {
+        cat("IUCN data for sciname ", sciname, "not found, looking for alternative names in NBA\n")
+        nba_names <- get_all_scinames(regnr, sciname)
+        cat("Found ", length(nba_names), " more names in NBA\n")
+
+        for (sc in nba_names) {
+            cat("Searching in IUCN for name ", sc, "\n")
+            iucn_res <- get_IUCN_for_sciname(sc)            
+            if(! all(is.na(iucn_res))) {
+                cat("Found sciname via IUCN API\n")        
+                data[, c("iucn_id", "iucn_category")] <- iucn_res[c("iucn_id", "iucn_category")]
+                data[,"found_via_nba"] <- TRUE
+                break
+            }        
+        }                
+    }
+    cat("\n\n")
+}
